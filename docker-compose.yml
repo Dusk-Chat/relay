@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  dusk-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dusk-relay
+    restart: unless-stopped
+    ports:
+      - "4001:4001"
+    environment:
+      - RUST_LOG=info
+      - DUSK_RELAY_PORT=4001
+    volumes:
+      # persist the relay's keypair so peer id stays stable across restarts
+      - dusk-relay-data:/data
+    networks:
+      - dusk-network
+    healthcheck:
+      test: ["CMD", "timeout", "5", "bash", "-c", "cat < /dev/null > /dev/tcp/0.0.0.0/4001"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  dusk-relay-data:
+    driver: local
+
+networks:
+  dusk-network:
+    driver: bridge

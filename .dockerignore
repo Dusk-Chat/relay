@@ -1,0 +1,30 @@
+# target directory
+target/
+
+# git files
+.git/
+.gitignore
+.gitattributes
+
+# ide files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# os files
+.DS_Store
+Thumbs.db
+
+# docker files
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# documentation
+*.md
+docs/
+
+# ci/cd
+.github/

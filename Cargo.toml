@@ -1,0 +1,23 @@
+[package]
+name = "dusk-relay"
+version = "0.1.0"
+description = "dusk relay server - tracker-style rendezvous node for peer discovery without IP exposure"
+edition = "2021"
+
+[dependencies]
+libp2p = { version = "0.54", features = [
+    "relay",
+    "rendezvous",
+    "identify",
+    "ping",
+    "noise",
+    "yamux",
+    "tcp",
+    "tokio",
+    "macros",
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+log = "0.4"
+env_logger = "0.11"
+directories = "5"
