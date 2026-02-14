@@ -51,6 +51,12 @@ WORKDIR /data
 # expose the default relay port
 EXPOSE 4001
 
+# persist keypair and data to the volume-mounted /data directory
+# XDG_DATA_HOME tells the directories crate to resolve paths under /data
+# so the keypair ends up at /data/dusk-relay/keypair instead of ~/.local/share
+ENV XDG_DATA_HOME=/data
+VOLUME /data
+
 # set environment variables
 ENV RUST_LOG=info
 ENV DUSK_RELAY_PORT=4001
