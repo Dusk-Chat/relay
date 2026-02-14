@@ -93,10 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "/dusk/relay/1.0.0".to_string(),
                     key.public(),
                 )),
-                ping: ping::Behaviour::default(),
+                // ping every 30s to keep peer connections alive
+                ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30))),
             }
         })?
-        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(120)))
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
     // listen on all interfaces
