@@ -13,17 +13,24 @@
 //   RUST_LOG=info cargo run
 //   DUSK_RELAY_PORT=4001 cargo run  (custom port)
 //   DUSK_PEER_RELAYS="addr1,addr2" cargo run  (federation)
+//   DUSK_MAX_CONNECTIONS=10000 cargo run  (connection limit, default 10k)
 //
 // canonical public relay (default in dusk chat clients):
 //   /dns4/relay.duskchat.app/tcp/4001/p2p/12D3KooWGQkCkACcibJPKzus7Q6U1aYngfTuS4gwYwmJkJJtrSaw
+//
+// recommended connection limits by instance size:
+//   t3.small (2GB):  5,000 max connections
+//   t3.medium (4GB): 10,000 max connections (default)
+//   t3.large (8GB):  20,000 max connections
+//   c6i.xlarge:      50,000 max connections (with kernel tuning)
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, noise, ping, relay, rendezvous, swarm::SwarmEvent, tcp, yamux, Multiaddr,
-    PeerId,
+    connection_limits, gossipsub, identify, noise, ping, relay, rendezvous, swarm::SwarmEvent,
+    tcp, yamux, Multiaddr, PeerId,
 };
 
 // gossip message for relay-to-relay federation
@@ -45,6 +52,7 @@ struct RelayBehaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+    limits: connection_limits::Behaviour,
 }
 
 // resolve the path where we persist the relay's keypair so the peer id is stable
@@ -95,6 +103,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(4001);
 
+    // max concurrent peer connections (not including peer relay connections)
+    // default 10k, configurable via env var for different instance sizes
+    let max_connections: u32 = std::env::var("DUSK_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(10_000);
+
+    log::info!("connection limit: {} max concurrent peers", max_connections);
+
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_tcp(
@@ -124,6 +141,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .expect("valid gossipsub behaviour");
 
+            // read connection limit (max total concurrent connections across all peers)
+            let max_connections = std::env::var("DUSK_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(10_000);
+
             RelayBehaviour {
                 relay: relay::Behaviour::new(peer_id, relay::Config::default()),
                 rendezvous: rendezvous::server::Behaviour::new(
@@ -136,6 +159,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
                 // ping every 30s to keep peer connections alive
                 ping: ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30))),
+                // limit total concurrent connections (default 10k for ~t3.medium)
+                limits: connection_limits::Behaviour::new(
+                    connection_limits::ConnectionLimits::default()
+                        .with_max_established(Some(max_connections))
+                ),
             }
         })?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
@@ -356,6 +384,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         peer_id,
                         connection_count
                     );
+                }
+            }
+
+            // connection limit events
+            SwarmEvent::IncomingConnectionError { error, .. } => {
+                if let libp2p::swarm::ListenError::Denied { cause } = error {
+                    if cause.to_string().contains("connection limit") {
+                        log::warn!(
+                            "connection rejected: relay at capacity ({} max connections)",
+                            max_connections
+                        );
+                    }
                 }
             }
 
