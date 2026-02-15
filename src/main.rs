@@ -7,6 +7,7 @@
 // - circuit relay v2: peers connect through this node, never seeing each other's IPs
 // - rendezvous: peers register under community namespaces, discover each other by peer ID
 // - relay federation: gossips peer registrations to other relays for global discovery
+// - gif service: responds to gif search requests from clients via request-response protocol
 // - no data storage, no message routing, just connection brokering
 //
 // usage:
@@ -29,8 +30,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::{
-    connection_limits, gossipsub, identify, noise, ping, relay, rendezvous, swarm::SwarmEvent,
-    tcp, yamux, Multiaddr, PeerId,
+    connection_limits, gossipsub, identify, noise, ping, relay, rendezvous,
+    request_response::{self, cbor, ProtocolSupport},
+    swarm::SwarmEvent, tcp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
 
 // gossip message for relay-to-relay federation
@@ -53,7 +55,120 @@ struct RelayBehaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     limits: connection_limits::Behaviour,
+    // gif search service - clients send GifRequest, relay responds with GifResponse
+    gif_service: cbor::Behaviour<GifRequest, GifResponse>,
 }
+
+// ---- gif protocol ----
+// clients send a GifRequest over request-response and the relay responds
+// with a GifResponse after fetching from klipy. the api key stays on the
+// relay so clients never need credentials.
+
+const GIF_PROTOCOL: StreamProtocol = StreamProtocol::new("/dusk/gif/1.0.0");
+const KLIPY_API_BASE: &str = "https://api.klipy.com/v2";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GifRequest {
+    // "search" or "trending"
+    pub kind: String,
+    // search query (only used when kind == "search")
+    pub query: String,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GifResponse {
+    pub results: Vec<GifResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GifResult {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    pub preview: String,
+    pub dims: [u32; 2],
+}
+
+// fetch from klipy and normalize into our GifResult format
+async fn fetch_klipy(
+    http: &reqwest::Client,
+    api_key: &str,
+    request: &GifRequest,
+) -> Vec<GifResult> {
+    let limit = request.limit.min(50);
+    let url = if request.kind == "search" && !request.query.trim().is_empty() {
+        format!(
+            "{}/search?q={}&key={}&limit={}&media_filter=tinygif,gif",
+            KLIPY_API_BASE,
+            urlencoding::encode(&request.query),
+            api_key,
+            limit,
+        )
+    } else {
+        format!(
+            "{}/featured?key={}&limit={}&media_filter=tinygif,gif",
+            KLIPY_API_BASE,
+            api_key,
+            limit,
+        )
+    };
+
+    let resp = match http.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("klipy request failed: {}", e);
+            return vec![];
+        }
+    };
+
+    if !resp.status().is_success() {
+        log::warn!("klipy returned status {}", resp.status());
+        return vec![];
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("klipy json parse error: {}", e);
+            return vec![];
+        }
+    };
+
+    body["results"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let gif_url = r["media_formats"]["gif"]["url"].as_str()?;
+                    let preview_url = r["media_formats"]["tinygif"]["url"].as_str()?;
+                    let dims = r["media_formats"]["tinygif"]["dims"]
+                        .as_array()
+                        .and_then(|d| {
+                            Some([
+                                d.first()?.as_u64()? as u32,
+                                d.get(1)?.as_u64()? as u32,
+                            ])
+                        })
+                        .unwrap_or([220, 165]);
+
+                    Some(GifResult {
+                        id: r["id"].as_str().unwrap_or_default().to_string(),
+                        title: r["content_description"]
+                            .as_str()
+                            .or_else(|| r["title"].as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        url: gif_url.to_string(),
+                        preview: preview_url.to_string(),
+                        dims,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+// ---- end gif protocol ----
 
 // resolve the path where we persist the relay's keypair so the peer id is stable
 fn keypair_path() -> PathBuf {
@@ -94,6 +209,23 @@ fn load_or_generate_keypair() -> libp2p::identity::Keypair {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // load .env file if present (for KLIPY_API_KEY etc)
+    dotenvy::dotenv().ok();
+
+    // klipy api key for gif service (stays on the relay, never sent to clients)
+    let klipy_api_key = std::env::var("KLIPY_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
+
+    if klipy_api_key.is_some() {
+        log::info!("klipy api key found, gif service enabled");
+    } else {
+        log::warn!("KLIPY_API_KEY not set, gif service will return empty results");
+    }
+
+    // http client for klipy api calls (shared across requests)
+    let http_client = reqwest::Client::new();
 
     let keypair = load_or_generate_keypair();
     let local_peer_id = keypair.public().to_peer_id();
@@ -163,6 +295,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 limits: connection_limits::Behaviour::new(
                     connection_limits::ConnectionLimits::default()
                         .with_max_established(Some(max_connections))
+                ),
+                // gif search service over request-response protocol
+                gif_service: cbor::Behaviour::new(
+                    [(GIF_PROTOCOL, ProtocolSupport::Inbound)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(15)),
                 ),
             }
         })?
@@ -344,6 +482,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     registration.namespace
                 );
             }
+
+            // gif service - incoming search/trending requests from clients
+            SwarmEvent::Behaviour(RelayBehaviourEvent::GifService(
+                request_response::Event::Message {
+                    peer,
+                    message: request_response::Message::Request { request, channel, .. },
+                    ..
+                }
+            )) => {
+                log::info!("gif {} request from peer {}", request.kind, peer);
+
+                let api_key = klipy_api_key.clone();
+                let http = http_client.clone();
+
+                // run the klipy fetch in a separate task so we dont block the event loop
+                let results = if let Some(ref key) = api_key {
+                    fetch_klipy(&http, key, &request).await
+                } else {
+                    vec![]
+                };
+
+                let response = GifResponse { results };
+                if swarm.behaviour_mut().gif_service.send_response(channel, response).is_err() {
+                    log::warn!("failed to send gif response to {}", peer);
+                }
+            }
+            // ignore outbound response sent confirmation
+            SwarmEvent::Behaviour(RelayBehaviourEvent::GifService(
+                request_response::Event::Message {
+                    message: request_response::Message::Response { .. }, ..
+                }
+            )) => {}
+            SwarmEvent::Behaviour(RelayBehaviourEvent::GifService(
+                request_response::Event::OutboundFailure { peer, error, .. }
+            )) => {
+                log::warn!("gif outbound failure to {}: {:?}", peer, error);
+            }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::GifService(
+                request_response::Event::InboundFailure { peer, error, .. }
+            )) => {
+                log::debug!("gif inbound failure from {}: {:?}", peer, error);
+            }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::GifService(_)) => {}
 
             // connection tracking
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
