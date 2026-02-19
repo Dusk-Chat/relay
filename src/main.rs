@@ -29,6 +29,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use rusqlite::{params, Connection};
+
 use futures::StreamExt;
 use libp2p::{
     connection_limits, gossipsub, identify, noise, ping, relay, rendezvous,
@@ -59,6 +61,8 @@ struct RelayBehaviour {
     limits: connection_limits::Behaviour,
     // gif search service - clients send GifRequest, relay responds with GifResponse
     gif_service: cbor::Behaviour<GifRequest, GifResponse>,
+    // persistent directory service - clients register/search peer profiles
+    directory_service: cbor::Behaviour<DirectoryRequest, DirectoryResponse>,
 }
 
 // ---- gif protocol ----
@@ -67,6 +71,8 @@ struct RelayBehaviour {
 // relay so clients never need credentials.
 
 const GIF_PROTOCOL: StreamProtocol = StreamProtocol::new("/dusk/gif/1.0.0");
+const DIRECTORY_PROTOCOL: libp2p::StreamProtocol =
+    libp2p::StreamProtocol::new("/dusk/directory/1.0.0");
 const KLIPY_API_BASE: &str = "https://api.klipy.com/v2";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -202,6 +208,35 @@ impl GifRateLimiter {
 }
 // ---- end gif rate limiter ----
 
+// ---- directory protocol ----
+// clients register their display_name here so others can search
+// even when that peer is offline. the relay only stores peer_id + display_name.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum DirectoryRequest {
+    // register/update this peer's display_name in the index
+    // peer_id is taken from the libp2p connection, not trusted from the request
+    Register { display_name: String },
+    // search the index by display_name (LIKE %query%) or exact peer_id
+    Search { query: String },
+    // remove this peer's profile from the index
+    Remove,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum DirectoryResponse {
+    Ok,
+    Results(Vec<DirectoryProfileEntry>),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DirectoryProfileEntry {
+    pub peer_id: String,
+    pub display_name: String,
+    pub last_seen: u64,
+}
+// ---- end directory protocol ----
+
 // fetch from klipy and normalize into our GifResult format
 async fn fetch_klipy(
     http: &reqwest::Client,
@@ -311,6 +346,34 @@ fn load_or_generate_keypair() -> libp2p::identity::Keypair {
         }
     }
     kp
+}
+
+// resolve path for the relay's persistent directory database
+fn directory_db_path() -> std::path::PathBuf {
+    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "dusk-relay") {
+        let dir = proj_dirs.data_dir().to_path_buf();
+        std::fs::create_dir_all(&dir).ok();
+        dir.join("directory.sqlite3")
+    } else {
+        std::path::PathBuf::from("./relay_directory.sqlite3")
+    }
+}
+
+fn open_directory_db() -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(directory_db_path())?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         CREATE TABLE IF NOT EXISTS peer_profiles (
+             peer_id       TEXT PRIMARY KEY,
+             display_name  TEXT NOT NULL,
+             last_seen     INTEGER NOT NULL,
+             registered_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_display_name
+             ON peer_profiles(display_name COLLATE NOCASE);",
+    )?;
+    Ok(conn)
 }
 
 #[tokio::main]
@@ -428,6 +491,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(15)),
                 ),
+                // persistent directory service - clients register/search/remove profiles
+                directory_service: cbor::Behaviour::new(
+                    [(DIRECTORY_PROTOCOL, ProtocolSupport::Inbound)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(15)),
+                ),
             }
         })?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
@@ -501,6 +570,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // track peer relay connections for federation metrics
     let mut connected_peer_relays: Vec<PeerId> = Vec::new();
+
+    let dir_db = match open_directory_db() {
+        Ok(db) => {
+            log::info!("directory db opened at {}", directory_db_path().display());
+            db
+        }
+        Err(e) => {
+            log::error!("failed to open directory db: {}", e);
+            return Err(e.into());
+        }
+    };
+    let now_secs = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
 
     loop {
         let event = tokio::select! {
@@ -799,6 +885,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info.agent_version
                 );
             }
+
+            // directory service - clients register/search/remove their profiles
+            SwarmEvent::Behaviour(RelayBehaviourEvent::DirectoryService(
+                request_response::Event::Message {
+                    peer,
+                    message: request_response::Message::Request { request, channel, .. },
+                    ..
+                },
+            )) => {
+                let response = match request {
+                    DirectoryRequest::Register { display_name } => {
+                        let ts = now_secs();
+                        let result = dir_db.execute(
+                            "INSERT INTO peer_profiles (peer_id, display_name, last_seen, registered_at)
+                             VALUES (?1, ?2, ?3, ?3)
+                             ON CONFLICT(peer_id) DO UPDATE SET
+                                 display_name  = excluded.display_name,
+                                 last_seen     = excluded.last_seen",
+                            params![peer.to_string(), display_name, ts as i64],
+                        );
+                        match result {
+                            Ok(_) => {
+                                log::info!("directory: registered peer {} as '{}'", peer, display_name);
+                                DirectoryResponse::Ok
+                            }
+                            Err(e) => {
+                                log::warn!("directory: failed to register {}: {}", peer, e);
+                                DirectoryResponse::Ok
+                            }
+                        }
+                    }
+                    DirectoryRequest::Search { query } => {
+                        let trimmed = query.trim().to_string();
+                        let like_pattern = format!("%{}%", trimmed);
+
+                        let mut stmt = dir_db.prepare(
+                            "SELECT peer_id, display_name, last_seen FROM peer_profiles
+                             WHERE lower(display_name) LIKE lower(?1)
+                                OR peer_id = ?2
+                             ORDER BY last_seen DESC
+                             LIMIT 20"
+                        );
+                        let entries = match stmt {
+                            Ok(ref mut s) => s.query_map(
+                                params![like_pattern, trimmed],
+                                |row| {
+                                    let last_seen: i64 = row.get(2)?;
+                                    Ok(DirectoryProfileEntry {
+                                        peer_id: row.get(0)?,
+                                        display_name: row.get(1)?,
+                                        last_seen: last_seen.max(0) as u64,
+                                    })
+                                },
+                            ).map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+                             .unwrap_or_default(),
+                            Err(e) => {
+                                log::warn!("directory: search query failed: {}", e);
+                                vec![]
+                            }
+                        };
+                        log::info!(
+                            "directory: search '{}' -> {} results",
+                            trimmed,
+                            entries.len()
+                        );
+                        DirectoryResponse::Results(entries)
+                    }
+                    DirectoryRequest::Remove => {
+                        let _ = dir_db.execute(
+                            "DELETE FROM peer_profiles WHERE peer_id = ?1",
+                            params![peer.to_string()],
+                        );
+                        log::info!("directory: removed profile for {}", peer);
+                        DirectoryResponse::Ok
+                    }
+                };
+
+                if swarm
+                    .behaviour_mut()
+                    .directory_service
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    log::warn!("directory: failed to send response to {}", peer);
+                }
+            }
+            // ignore outbound and other directory service events
+            SwarmEvent::Behaviour(RelayBehaviourEvent::DirectoryService(_)) => {}
 
             _ => {}
         }
