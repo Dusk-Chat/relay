@@ -48,8 +48,15 @@ USER dusk
 # set working directory
 WORKDIR /data
 
-# expose the default relay port
+# expose the default relay port (libp2p)
 EXPOSE 4001
+
+# expose TURN server ports (UDP + TCP signaling)
+EXPOSE 3478/udp
+EXPOSE 3478/tcp
+
+# expose TURN relay allocation port range (UDP)
+EXPOSE 49152-65535/udp
 
 # persist keypair and data to the volume-mounted /data directory
 # XDG_DATA_HOME tells the directories crate to resolve paths under /data
@@ -60,6 +67,19 @@ VOLUME /data
 # set environment variables
 ENV RUST_LOG=info
 ENV DUSK_RELAY_PORT=4001
+
+# TURN server environment variables
+ENV DUSK_TURN_ENABLED=true
+ENV DUSK_TURN_PUBLIC_IP=""
+ENV DUSK_TURN_SECRET=""
+ENV DUSK_TURN_UDP_PORT=3478
+ENV DUSK_TURN_TCP_PORT=3478
+ENV DUSK_TURN_REALM=duskchat.app
+ENV DUSK_TURN_PORT_RANGE_START=49152
+ENV DUSK_TURN_PORT_RANGE_END=65535
+ENV DUSK_TURN_MAX_ALLOCATIONS=1000
+ENV DUSK_TURN_MAX_PER_USER=10
+ENV DUSK_TURN_PUBLIC_HOST=""
 
 # health check to verify the relay is listening
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

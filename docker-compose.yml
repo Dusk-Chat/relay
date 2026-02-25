@@ -8,10 +8,32 @@ services:
     container_name: dusk-relay
     restart: unless-stopped
     ports:
+      # libp2p relay port
       - "4001:4001"
+      # TURN server signaling (UDP + TCP)
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      # TURN relay allocation ports (UDP)
+      # NOTE: using a smaller range (49152-50000) for Docker; adjust as needed
+      - "49152-50000:49152-50000/udp"
     environment:
       - RUST_LOG=info
+      # libp2p relay
       - DUSK_RELAY_PORT=4001
+      - DUSK_PEER_RELAYS=
+      - KLIPY_API_KEY=
+      # TURN server
+      - DUSK_TURN_ENABLED=true
+      - DUSK_TURN_PUBLIC_IP=${DUSK_TURN_PUBLIC_IP:?Set DUSK_TURN_PUBLIC_IP to your server public IP}
+      - DUSK_TURN_SECRET=${DUSK_TURN_SECRET:?Set DUSK_TURN_SECRET for HMAC credentials}
+      - DUSK_TURN_UDP_PORT=3478
+      - DUSK_TURN_TCP_PORT=3478
+      - DUSK_TURN_REALM=duskchat.app
+      - DUSK_TURN_PORT_RANGE_START=49152
+      - DUSK_TURN_PORT_RANGE_END=50000
+      - DUSK_TURN_MAX_ALLOCATIONS=1000
+      - DUSK_TURN_MAX_PER_USER=10
+      - DUSK_TURN_PUBLIC_HOST=${DUSK_TURN_PUBLIC_HOST:-}
     volumes:
       # persist the relay's keypair so peer id stays stable across restarts
       - dusk-relay-data:/data

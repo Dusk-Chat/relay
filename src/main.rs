@@ -25,6 +25,8 @@
 //   t3.large (8GB):  20,000 max connections
 //   c6i.xlarge:      50,000 max connections (with kernel tuning)
 
+mod turn;
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -63,6 +65,8 @@ struct RelayBehaviour {
     gif_service: cbor::Behaviour<GifRequest, GifResponse>,
     // persistent directory service - clients register/search peer profiles
     directory_service: cbor::Behaviour<DirectoryRequest, DirectoryResponse>,
+    // TURN credential service - clients request time-limited TURN server credentials
+    turn_credentials: cbor::Behaviour<TurnCredentialRequest, TurnCredentialResponse>,
 }
 
 // ---- gif protocol ----
@@ -227,6 +231,7 @@ pub enum DirectoryRequest {
 pub enum DirectoryResponse {
     Ok,
     Results(Vec<DirectoryProfileEntry>),
+    Error(String),
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -236,6 +241,28 @@ pub struct DirectoryProfileEntry {
     pub last_seen: u64,
 }
 // ---- end directory protocol ----
+
+// ---- TURN credential protocol ----
+// clients request time-limited TURN credentials over libp2p request-response.
+// the relay generates HMAC-SHA1 credentials that the client then uses when
+// talking to the TURN server directly via UDP/TCP (separate from the libp2p swarm).
+
+const TURN_CREDENTIALS_PROTOCOL: StreamProtocol =
+    StreamProtocol::new("/dusk/turn-credentials/1.0.0");
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TurnCredentialRequest {
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TurnCredentialResponse {
+    pub username: String,
+    pub password: String,
+    pub ttl: u64,
+    pub uris: Vec<String>, // TURN server URIs like ["turn:relay.duskchat.app:3478", "turn:relay.duskchat.app:3478?transport=tcp"]
+}
+// ---- end TURN credential protocol ----
 
 // fetch from klipy and normalize into our GifResult format
 async fn fetch_klipy(
@@ -342,6 +369,18 @@ fn load_or_generate_keypair() -> libp2p::identity::Keypair {
         if let Err(e) = std::fs::write(&path, &bytes) {
             log::warn!("failed to persist keypair: {}", e);
         } else {
+            // restrict keypair file to owner-only read/write (0600) so other
+            // users on a shared server cannot read the relay's private key
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) = std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(0o600),
+                ) {
+                    log::warn!("failed to set keypair file permissions: {}", e);
+                }
+            }
             log::info!("saved new keypair to {}", path.display());
         }
     }
@@ -460,12 +499,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .expect("valid gossipsub behaviour");
 
-            // read connection limit (max total concurrent connections across all peers)
-            let max_connections = std::env::var("DUSK_MAX_CONNECTIONS")
-                .ok()
-                .and_then(|c| c.parse().ok())
-                .unwrap_or(10_000);
-
             RelayBehaviour {
                 relay: relay::Behaviour::new(peer_id, relay::Config::default()),
                 rendezvous: rendezvous::server::Behaviour::new(
@@ -497,6 +530,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(15)),
                 ),
+                // TURN credential service - clients request time-limited TURN credentials
+                turn_credentials: cbor::Behaviour::new(
+                    [(TURN_CREDENTIALS_PROTOCOL, ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(15)),
+                ),
             }
         })?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
@@ -511,6 +550,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let canonical_addr = format!("/ip4/0.0.0.0/tcp/{}/p2p/{}", port, local_peer_id);
     println!("\n  relay address: {}\n", canonical_addr);
+
+    // ---- TURN server startup ----
+    // get the shared secret for credential generation (shared between TURN server and credential protocol)
+    let turn_shared_secret: Vec<u8> = std::env::var("DUSK_TURN_SECRET")
+        .unwrap_or_else(|_| {
+            eprintln!("[TURN] WARNING: DUSK_TURN_SECRET not set, generating random secret");
+            eprintln!("[TURN] This means credentials won't survive restarts and won't work across multiple relay instances");
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            format!("dusk-turn-random-{}", timestamp)
+        })
+        .into_bytes();
+
+    // start TURN server if enabled (runs on separate UDP/TCP ports from the libp2p swarm)
+    let _turn_handle = if turn::TurnServerConfig::is_enabled() {
+        let turn_config = turn::TurnServerConfig::from_env();
+        let turn_server = turn::TurnServer::new(turn_config);
+        match turn_server.run().await {
+            Ok(handle) => {
+                println!("[RELAY] TURN server started");
+                Some(handle)
+            }
+            Err(e) => {
+                eprintln!("[RELAY] Failed to start TURN server: {}", e);
+                None
+            }
+        }
+    } else {
+        println!("[RELAY] TURN server disabled");
+        None
+    };
+    // ---- end TURN server startup ----
 
     // subscribe to the relay federation gossip topic
     let federation_topic = gossipsub::IdentTopic::new("dusk/relay/federation");
@@ -896,23 +969,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )) => {
                 let response = match request {
                     DirectoryRequest::Register { display_name } => {
-                        let ts = now_secs();
-                        let result = dir_db.execute(
-                            "INSERT INTO peer_profiles (peer_id, display_name, last_seen, registered_at)
-                             VALUES (?1, ?2, ?3, ?3)
-                             ON CONFLICT(peer_id) DO UPDATE SET
-                                 display_name  = excluded.display_name,
-                                 last_seen     = excluded.last_seen",
-                            params![peer.to_string(), display_name, ts as i64],
-                        );
-                        match result {
-                            Ok(_) => {
-                                log::info!("directory: registered peer {} as '{}'", peer, display_name);
-                                DirectoryResponse::Ok
-                            }
-                            Err(e) => {
-                                log::warn!("directory: failed to register {}: {}", peer, e);
-                                DirectoryResponse::Ok
+                        // validate display_name: reject empty or excessively long names
+                        let trimmed_name = display_name.trim();
+                        if trimmed_name.is_empty() || trimmed_name.len() > 64 {
+                            log::warn!(
+                                "directory: rejected registration from {} (name length {})",
+                                peer,
+                                trimmed_name.len()
+                            );
+                            DirectoryResponse::Error(
+                                "display_name must be 1-64 characters".to_string(),
+                            )
+                        } else {
+                            let ts = now_secs();
+                            let result = dir_db.execute(
+                                "INSERT INTO peer_profiles (peer_id, display_name, last_seen, registered_at)
+                                 VALUES (?1, ?2, ?3, ?3)
+                                 ON CONFLICT(peer_id) DO UPDATE SET
+                                     display_name  = excluded.display_name,
+                                     last_seen     = excluded.last_seen",
+                                params![peer.to_string(), trimmed_name, ts as i64],
+                            );
+                            match result {
+                                Ok(_) => {
+                                    log::info!("directory: registered peer {} as '{}'", peer, trimmed_name);
+                                    DirectoryResponse::Ok
+                                }
+                                Err(e) => {
+                                    log::warn!("directory: failed to register {}: {}", peer, e);
+                                    DirectoryResponse::Error(format!("registration failed: {}", e))
+                                }
                             }
                         }
                     }
@@ -973,6 +1059,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // ignore outbound and other directory service events
             SwarmEvent::Behaviour(RelayBehaviourEvent::DirectoryService(_)) => {}
+
+            // ---- TURN credential service ----
+            // clients request time-limited credentials for the TURN server
+            SwarmEvent::Behaviour(RelayBehaviourEvent::TurnCredentials(
+                request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Request {
+                            request, channel, ..
+                        },
+                    ..
+                },
+            )) => {
+                let peer_id_str = request.peer_id.clone();
+
+                // generate time-limited credentials using the shared secret
+                let (username, password) = turn::credentials::generate_credentials(
+                    &peer_id_str,
+                    &turn_shared_secret,
+                    86400, // 24 hours
+                );
+
+                // build TURN URIs using the relay's public hostname/IP
+                let turn_host = std::env::var("DUSK_TURN_PUBLIC_HOST")
+                    .unwrap_or_else(|_| {
+                        std::env::var("DUSK_TURN_PUBLIC_IP")
+                            .unwrap_or_else(|_| "relay.duskchat.app".to_string())
+                    });
+                let turn_port: u16 = std::env::var("DUSK_TURN_UDP_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(3478);
+
+                let response = TurnCredentialResponse {
+                    username,
+                    password,
+                    ttl: 86400,
+                    uris: vec![
+                        format!("turn:{}:{}", turn_host, turn_port),
+                        format!("turn:{}:{}?transport=tcp", turn_host, turn_port),
+                    ],
+                };
+
+                if swarm
+                    .behaviour_mut()
+                    .turn_credentials
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    log::warn!("[TURN-CREDS] failed to send credentials to {:?}", peer);
+                }
+                log::info!(
+                    "[TURN-CREDS] generated credentials for peer {} (requested by {:?})",
+                    peer_id_str,
+                    peer
+                );
+            }
+            // we're the server so we don't send requests, but handle all variants
+            SwarmEvent::Behaviour(RelayBehaviourEvent::TurnCredentials(
+                request_response::Event::Message {
+                    message: request_response::Message::Response { .. },
+                    ..
+                },
+            )) => {}
+            SwarmEvent::Behaviour(RelayBehaviourEvent::TurnCredentials(
+                request_response::Event::OutboundFailure { .. },
+            )) => {}
+            SwarmEvent::Behaviour(RelayBehaviourEvent::TurnCredentials(
+                request_response::Event::InboundFailure { peer, error, .. },
+            )) => {
+                log::warn!(
+                    "[TURN-CREDS] inbound failure from {:?}: {:?}",
+                    peer,
+                    error
+                );
+            }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::TurnCredentials(
+                request_response::Event::ResponseSent { .. },
+            )) => {}
 
             _ => {}
         }
