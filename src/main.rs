@@ -520,6 +520,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subscribe(&federation_topic)?;
     log::info!("subscribed to relay federation topic");
 
+    // subscribe to the global directory topic so peers on the relay can discover each other
+    let directory_topic = gossipsub::IdentTopic::new("dusk/directory");
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&directory_topic)?;
+    log::info!("subscribed to global directory topic");
+
     // connect to peer relays for federation (from env var, comma-separated multiaddrs)
     let peer_relays: Vec<Multiaddr> = std::env::var("DUSK_PEER_RELAYS")
         .ok()
