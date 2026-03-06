@@ -898,7 +898,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SwarmEvent::Behaviour(RelayBehaviourEvent::DirectoryService(
                 request_response::Event::Message {
                     peer,
-                    message: request_response::Message::Request { request, channel, .. },
+                    message:
+                        request_response::Message::Request {
+                            request, channel, ..
+                        },
                     ..
                 },
             )) => {
@@ -915,7 +918,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         match result {
                             Ok(_) => {
-                                log::info!("directory: registered peer {} as '{}'", peer, display_name);
+                                log::info!(
+                                    "directory: registered peer {} as '{}'",
+                                    peer,
+                                    display_name
+                                );
                                 DirectoryResponse::Ok
                             }
                             Err(e) => {
@@ -933,21 +940,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              WHERE lower(display_name) LIKE lower(?1)
                                 OR peer_id = ?2
                              ORDER BY last_seen DESC
-                             LIMIT 20"
+                             LIMIT 20",
                         );
                         let entries = match stmt {
-                            Ok(ref mut s) => s.query_map(
-                                params![like_pattern, trimmed],
-                                |row| {
+                            Ok(ref mut s) => s
+                                .query_map(params![like_pattern, trimmed], |row| {
                                     let last_seen: i64 = row.get(2)?;
                                     Ok(DirectoryProfileEntry {
                                         peer_id: row.get(0)?,
                                         display_name: row.get(1)?,
                                         last_seen: last_seen.max(0) as u64,
                                     })
-                                },
-                            ).map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
-                             .unwrap_or_default(),
+                                })
+                                .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+                                .unwrap_or_default(),
                             Err(e) => {
                                 log::warn!("directory: search query failed: {}", e);
                                 vec![]
