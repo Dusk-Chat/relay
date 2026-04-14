@@ -15,6 +15,7 @@
 //   DUSK_RELAY_PORT=4001 cargo run  (custom port)
 //   DUSK_PEER_RELAYS="addr1,addr2" cargo run  (federation)
 //   DUSK_MAX_CONNECTIONS=10000 cargo run  (connection limit, default 10k)
+//   DUSK_RELAY_EXTERNAL_ADDR="/ip4/1.2.3.4/tcp/4001" cargo run  (override external addr)
 //
 // canonical public relay (default in dusk chat clients):
 //   /dns4/relay.duskchat.app/tcp/4001/p2p/12D3KooWGQkCkACcibJPKzus7Q6U1aYngfTuS4gwYwmJkJJtrSaw
@@ -526,6 +527,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // listen on all interfaces
     let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
     swarm.listen_on(listen_addr)?;
+
+    // advertise an external address so circuit relay reservations include reachable
+    // addresses. without this, clients get NoAddressesInReservation and the
+    // reservation fails. set DUSK_RELAY_EXTERNAL_ADDR to override (e.g. for local dev).
+    let external_addr: Multiaddr = std::env::var("DUSK_RELAY_EXTERNAL_ADDR")
+        .unwrap_or_else(|_| format!("/dns4/relay.duskchat.app/tcp/{}", port))
+        .parse()
+        .expect("invalid DUSK_RELAY_EXTERNAL_ADDR");
+    swarm.add_external_address(external_addr.clone());
+    log::info!("external address: {}", external_addr);
 
     log::info!("dusk relay server starting");
     log::info!("peer id: {}", local_peer_id);
