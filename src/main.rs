@@ -209,14 +209,18 @@ impl GifRateLimiter {
 // ---- end gif rate limiter ----
 
 // ---- directory protocol ----
-// clients register their display_name here so others can search
-// even when that peer is offline. the relay only stores peer_id + display_name.
+// clients register their profile + relay circuit address so others can
+// discover them and connect even without sharing a community.
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum DirectoryRequest {
-    // register/update this peer's display_name in the index
+    // register/update this peer's profile in the index
     // peer_id is taken from the libp2p connection, not trusted from the request
-    Register { display_name: String },
+    Register {
+        display_name: String,
+        // full relay circuit multiaddr for reaching this peer
+        relay_addr: String,
+    },
     // search the index by display_name (LIKE %query%) or exact peer_id
     Search { query: String },
     // remove this peer's profile from the index
@@ -234,6 +238,8 @@ pub struct DirectoryProfileEntry {
     pub peer_id: String,
     pub display_name: String,
     pub last_seen: u64,
+    // relay circuit address for connecting to this peer
+    pub relay_addr: String,
 }
 // ---- end directory protocol ----
 
@@ -367,12 +373,25 @@ fn open_directory_db() -> Result<Connection, rusqlite::Error> {
          CREATE TABLE IF NOT EXISTS peer_profiles (
              peer_id       TEXT PRIMARY KEY,
              display_name  TEXT NOT NULL,
+             relay_addr    TEXT NOT NULL DEFAULT '',
              last_seen     INTEGER NOT NULL,
              registered_at INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_display_name
              ON peer_profiles(display_name COLLATE NOCASE);",
     )?;
+
+    // migrate existing databases that predate the relay_addr column
+    let has_relay_addr = conn
+        .prepare("SELECT relay_addr FROM peer_profiles LIMIT 0")
+        .is_ok();
+    if !has_relay_addr {
+        conn.execute_batch(
+            "ALTER TABLE peer_profiles ADD COLUMN relay_addr TEXT NOT NULL DEFAULT '';",
+        )?;
+        log::info!("directory: migrated peer_profiles table (added relay_addr column)");
+    }
+
     Ok(conn)
 }
 
@@ -906,22 +925,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )) => {
                 let response = match request {
-                    DirectoryRequest::Register { display_name } => {
+                    DirectoryRequest::Register { display_name, relay_addr } => {
                         let ts = now_secs();
                         let result = dir_db.execute(
-                            "INSERT INTO peer_profiles (peer_id, display_name, last_seen, registered_at)
-                             VALUES (?1, ?2, ?3, ?3)
+                            "INSERT INTO peer_profiles (peer_id, display_name, relay_addr, last_seen, registered_at)
+                             VALUES (?1, ?2, ?3, ?4, ?4)
                              ON CONFLICT(peer_id) DO UPDATE SET
                                  display_name  = excluded.display_name,
+                                 relay_addr    = excluded.relay_addr,
                                  last_seen     = excluded.last_seen",
-                            params![peer.to_string(), display_name, ts as i64],
+                            params![peer.to_string(), display_name, relay_addr, ts as i64],
                         );
                         match result {
                             Ok(_) => {
                                 log::info!(
-                                    "directory: registered peer {} as '{}'",
+                                    "directory: registered peer {} as '{}' (relay: {})",
                                     peer,
-                                    display_name
+                                    display_name,
+                                    relay_addr,
                                 );
                                 DirectoryResponse::Ok
                             }
@@ -936,7 +957,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let like_pattern = format!("%{}%", trimmed);
 
                         let mut stmt = dir_db.prepare(
-                            "SELECT peer_id, display_name, last_seen FROM peer_profiles
+                            "SELECT peer_id, display_name, last_seen, relay_addr FROM peer_profiles
                              WHERE lower(display_name) LIKE lower(?1)
                                 OR peer_id = ?2
                              ORDER BY last_seen DESC
@@ -950,6 +971,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         peer_id: row.get(0)?,
                                         display_name: row.get(1)?,
                                         last_seen: last_seen.max(0) as u64,
+                                        relay_addr: row.get(3)?,
                                     })
                                 })
                                 .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
