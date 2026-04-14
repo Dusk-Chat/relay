@@ -219,6 +219,7 @@ pub enum DirectoryRequest {
     Register {
         display_name: String,
         // full relay circuit multiaddr for reaching this peer
+        #[serde(default)]
         relay_addr: String,
     },
     // search the index by display_name (LIKE %query%) or exact peer_id
@@ -239,6 +240,7 @@ pub struct DirectoryProfileEntry {
     pub display_name: String,
     pub last_seen: u64,
     // relay circuit address for connecting to this peer
+    #[serde(default)]
     pub relay_addr: String,
 }
 // ---- end directory protocol ----
@@ -1007,7 +1009,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::warn!("directory: failed to send response to {}", peer);
                 }
             }
-            // ignore outbound and other directory service events
+            SwarmEvent::Behaviour(RelayBehaviourEvent::DirectoryService(
+                request_response::Event::InboundFailure { peer, error, .. },
+            )) => {
+                log::warn!("directory inbound failure from {}: {:?}", peer, error);
+            }
             SwarmEvent::Behaviour(RelayBehaviourEvent::DirectoryService(_)) => {}
 
             _ => {}
