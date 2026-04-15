@@ -471,6 +471,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     msg.data.hash(&mut hasher);
+                    if let Some(ref source) = msg.source {
+                        source.hash(&mut hasher);
+                    }
                     gossipsub::MessageId::from(hasher.finish().to_string())
                 })
                 .build()
@@ -559,6 +562,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .gossipsub
         .subscribe(&directory_topic)?;
     log::info!("subscribed to global directory topic");
+
+    // subscribe to the global sync topic so peers can exchange crdt documents
+    // through the relay. without this, two peers connected only via relay circuit
+    // often fail to form a gossipsub mesh on this topic, causing sync to silently
+    // fail and members to not appear on one or both sides.
+    let sync_topic = gossipsub::IdentTopic::new("dusk/sync");
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&sync_topic)?;
+    log::info!("subscribed to global sync topic");
 
     // connect to peer relays for federation (from env var, comma-separated multiaddrs)
     let peer_relays: Vec<Multiaddr> = std::env::var("DUSK_PEER_RELAYS")
